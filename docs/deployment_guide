@@ -1,0 +1,217 @@
+# EduPredict — Deployment Guide
+
+> Maintained by: ML Engineers / Deployment Sub-Team
+
+---
+
+## Architecture Overview
+
+```
+Internet
+   │
+   ▼
+[Nginx — HTTPS / Let's Encrypt]
+   │
+   ▼
+[Gunicorn + Uvicorn workers]
+   │
+   ▼
+[FastAPI app — /predict endpoint]
+   │
+   ▼
+[XGBoost Model + Processed Data]
+```
+
+---
+
+## Prerequisites
+
+- Ubuntu 22.04 server (AWS EC2 t3.small or equivalent)
+- Domain name with DNS A record pointing to your server IP
+- Python 3.10+
+- Git
+
+---
+
+## Step 1 — Server Setup
+
+```bash
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install Python, pip, nginx, certbot
+sudo apt install -y python3 python3-pip python3-venv nginx certbot python3-certbot-nginx git
+
+# Create project user (optional but recommended)
+sudo adduser edupredict
+sudo usermod -aG sudo edupredict
+```
+
+---
+
+## Step 2 — Deploy Application
+
+```bash
+# Clone repository
+cd /home/edupredict
+git clone https://github.com/your-org/EduPredict.git
+cd EduPredict
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+pip install gunicorn
+
+# Run ETL and train model (first deploy only)
+python src/etl/pipeline.py
+python src/models/train.py
+python src/models/predict.py
+```
+
+---
+
+## Step 3 — Gunicorn Service
+
+Create a systemd service so the API starts automatically:
+
+```bash
+sudo nano /etc/systemd/system/edupredict.service
+```
+
+Paste:
+
+```ini
+[Unit]
+Description=EduPredict FastAPI Service
+After=network.target
+
+[Service]
+User=edupredict
+WorkingDirectory=/home/edupredict/EduPredict
+Environment="PATH=/home/edupredict/EduPredict/venv/bin"
+ExecStart=/home/edupredict/EduPredict/venv/bin/gunicorn \
+    -w 2 \
+    -k uvicorn.workers.UvicornWorker \
+    --bind 127.0.0.1:8000 \
+    --access-logfile /var/log/edupredict/access.log \
+    --error-logfile /var/log/edupredict/error.log \
+    app.main:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+# Create log directory
+sudo mkdir -p /var/log/edupredict
+sudo chown edupredict:edupredict /var/log/edupredict
+
+# Enable and start service
+sudo systemctl daemon-reload
+sudo systemctl enable edupredict
+sudo systemctl start edupredict
+sudo systemctl status edupredict
+```
+
+---
+
+## Step 4 — Nginx Configuration
+
+```bash
+sudo nano /etc/nginx/sites-available/edupredict
+```
+
+Paste:
+
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com www.your-domain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /health {
+        proxy_pass http://127.0.0.1:8000/health;
+    }
+}
+```
+
+```bash
+# Enable site
+sudo ln -s /etc/nginx/sites-available/edupredict /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+---
+
+## Step 5 — HTTPS via Let's Encrypt
+
+```bash
+sudo certbot --nginx -d your-domain.com -d www.your-domain.com
+```
+
+Follow the prompts. Certbot will auto-configure Nginx for HTTPS and set up certificate renewal.
+
+Verify auto-renewal:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+---
+
+## Step 6 — Verify Deployment
+
+```bash
+# Health check
+curl https://your-domain.com/health
+
+# Test prediction endpoint
+curl -X POST https://your-domain.com/predict \
+  -H "Content-Type: application/json" \
+  -d '{"country_code": "USA", "horizon": 10, "scenario": "baseline"}'
+```
+
+---
+
+## Logging
+
+| Log File | Contents |
+|---|---|
+| `/var/log/edupredict/access.log` | All HTTP requests |
+| `/var/log/edupredict/error.log` | Application errors |
+| `journalctl -u edupredict` | Systemd service logs |
+
+---
+
+## Updating the Application
+
+```bash
+cd /home/edupredict/EduPredict
+git pull origin main
+source venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart edupredict
+```
+
+---
+
+## Troubleshooting
+
+| Issue | Command |
+|---|---|
+| Service not running | `sudo systemctl status edupredict` |
+| Nginx errors | `sudo nginx -t && sudo journalctl -u nginx` |
+| Port conflict | `sudo lsof -i :8000` |
+| Certificate expired | `sudo certbot renew` |
